@@ -16,6 +16,10 @@ class MechSparseBatchResiduals:
     """
     r_ext: torch.Tensor
     r_par: torch.Tensor
+    # Optional per-component contributions used for feature-aware attribution
+    # (only populated when token_idx is provided and return_parts=True).
+    r_ext_parts: Optional[Dict[Tuple[int, int], torch.Tensor]] = None
+    r_par_parts: Optional[Dict[int, torch.Tensor]] = None
 
 
 def _is_llama_like(model) -> bool:
@@ -40,6 +44,8 @@ def get_mechsparse_residuals_llama_like(
     copy_heads: Sequence[Tuple[int, int]],
     knowledge_layers: Sequence[int],
     device: Optional[torch.device] = None,
+    token_idx: Optional[int] = None,
+    return_parts: bool = False,
 ) -> MechSparseBatchResiduals:
     """
     Extract approximate circuit-specific residual contributions for LLaMA-like HF models.
@@ -67,6 +73,10 @@ def get_mechsparse_residuals_llama_like(
     layers = _get_layers(model)
     bs, seq = input_ids.shape
     hidden = model.config.hidden_size
+    if token_idx is not None:
+        token_idx = int(token_idx)
+        if token_idx < 0 or token_idx >= seq:
+            raise ValueError(f"token_idx out of range: token_idx={token_idx}, seq={seq}")
 
     # Group copy_heads by layer for efficiency
     copy_heads_by_layer: Dict[int, List[int]] = {}
@@ -115,6 +125,8 @@ def get_mechsparse_residuals_llama_like(
     attentions = out.attentions  # tuple(num_layers) each: (bs, n_heads, tgt, src)
     r_ext = torch.zeros((bs, seq, hidden), device=device, dtype=torch.float32)
     r_par = torch.zeros((bs, seq, hidden), device=device, dtype=torch.float32)
+    r_ext_parts: Optional[Dict[Tuple[int, int], torch.Tensor]] = {} if (return_parts and token_idx is not None) else None
+    r_par_parts: Optional[Dict[int, torch.Tensor]] = {} if (return_parts and token_idx is not None) else None
 
     # Build r_ext by reconstructing each selected head output
     for layer_idx, heads in copy_heads_by_layer.items():
@@ -134,8 +146,16 @@ def get_mechsparse_residuals_llama_like(
         else:
             v = v.view(bs, seq, n_heads, head_dim).transpose(1, 2)
 
-        # ctx: (bs, n_heads, tgt, head_dim)
-        ctx = torch.matmul(attn_w, v)
+        # If token_idx is provided, we only compute ctx at that position.
+        # Otherwise compute full ctx for all tgt positions.
+        if token_idx is None:
+            # ctx: (bs, n_heads, tgt, head_dim)
+            ctx = torch.matmul(attn_w, v)
+        else:
+            # attn_w_token: (bs, n_heads, src)
+            attn_w_token = attn_w[:, :, token_idx, :]
+            # ctx_tok: (bs, n_heads, head_dim)
+            ctx_tok = torch.matmul(attn_w_token, v)
 
         # Project each selected head through its o_proj slice
         o_proj = layers[layer_idx].self_attn.o_proj
@@ -144,20 +164,40 @@ def get_mechsparse_residuals_llama_like(
         for head in heads:
             if head < 0 or head >= n_heads:
                 continue
-            head_ctx = ctx[:, head, :, :]  # (bs, tgt, head_dim)
             in_start = head * head_dim
             in_end = (head + 1) * head_dim
             W_slice = W_o[:, in_start:in_end]  # (hidden, head_dim)
-            # out: (bs, tgt, hidden)
-            head_out = torch.einsum("bth,dh->btd", head_ctx, W_slice)
-            r_ext += head_out
+
+            if token_idx is None:
+                head_ctx = ctx[:, head, :, :]  # (bs, tgt, head_dim)
+                # out: (bs, tgt, hidden)
+                head_out = torch.einsum("bth,dh->btd", head_ctx, W_slice)
+                r_ext += head_out
+            else:
+                head_ctx_tok = ctx_tok[:, head, :]  # (bs, head_dim)
+                # out: (bs, hidden)
+                head_out_tok = torch.einsum("bh,dh->bd", head_ctx_tok, W_slice)
+                r_ext[:, token_idx, :] += head_out_tok
+                if r_ext_parts is not None:
+                    r_ext_parts[(layer_idx, head)] = head_out_tok
 
     # Build r_par by summing MLP down_proj outputs from knowledge layers
     for layer_idx in knowledge_layers:
         mlp_out = mlp_cache.get(layer_idx, None)
         if mlp_out is None:
             continue
-        r_par += mlp_out.to(torch.float32)
+        mlp_out = mlp_out.to(torch.float32)
+        if token_idx is None:
+            r_par += mlp_out
+        else:
+            r_par[:, token_idx, :] += mlp_out[:, token_idx, :]
+            if r_par_parts is not None:
+                r_par_parts[layer_idx] = mlp_out[:, token_idx, :]
 
-    return MechSparseBatchResiduals(r_ext=r_ext, r_par=r_par)
+    return MechSparseBatchResiduals(
+        r_ext=r_ext,
+        r_par=r_par,
+        r_ext_parts=r_ext_parts,
+        r_par_parts=r_par_parts,
+    )
 

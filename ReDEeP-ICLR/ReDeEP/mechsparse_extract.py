@@ -48,6 +48,7 @@ def _construct_chunk_df(
         "response_id": [],
         "span_id": [],
         "task_type": [],
+        "split": [],
         "input": [],
         "output": [],
         **{f"ext_{k}": [] for k in range(top_n)},
@@ -66,12 +67,14 @@ def _construct_chunk_df(
         task_type = source_info_dict.get(source_id, {}).get("task_type", "unknown")
         prompt_text = source_info_dict.get(source_id, {}).get("prompt", "")
         response_text = resp.get("response", "")
+        split_val = str(resp.get("split", "unknown"))
         response_spans = resp.get("response_spans", None)
         scores = resp.get("scores", [])
         for j, span_obj in enumerate(scores):
             data_dict["response_id"].append(i)
             data_dict["span_id"].append(j)
             data_dict["task_type"].append(task_type)
+            data_dict["split"].append(split_val)
             data_dict["input"].append(prompt_text)
             if response_spans is not None and j < len(response_spans):
                 a, b = response_spans[j]
@@ -198,6 +201,7 @@ def _write_mechsparse_jsonl(
                 "response_id": int(df.iloc[i]["response_id"]),
                 "span_id": int(df.iloc[i]["span_id"]),
                 "task_type": str(df.iloc[i]["task_type"]),
+                "split": str(df.iloc[i]["split"]),
                 "input": str(df.iloc[i]["input"]),
                 "output": str(df.iloc[i]["output"]),
                 "label": int(df.iloc[i]["label"]),

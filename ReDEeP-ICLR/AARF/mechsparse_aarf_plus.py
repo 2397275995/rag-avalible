@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
+import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sys
@@ -38,6 +39,7 @@ RAGLENS_SRC = os.path.join(ROOT, "RAGLens", "src")
 sys.path.insert(0, RAGLENS_SRC)
 
 from RAGLens import RAGLens  # noqa: E402
+from mechsparse_residuals import get_mechsparse_residuals_llama_like  # noqa: E402
 
 
 @dataclass
@@ -45,6 +47,9 @@ class ReweightConfig:
     tau: float = 0.5
     alpha2: float = 1.3
     beta2: float = 0.7
+    max_active_features: int = 8
+    max_copy_layers_per_step: int = 6
+    max_knowledge_layers_per_step: int = 6
 
 
 class LayerReweighter:
@@ -60,16 +65,29 @@ class LayerReweighter:
         self.knowledge_layers = knowledge_layers
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
         self._enabled = False
+        self._active_copy_layers: Set[int] = set()
+        self._active_knowledge_layers: Set[int] = set()
         self._alpha2 = 1.0
         self._beta2 = 1.0
 
-    def enable(self, *, alpha2: float, beta2: float):
+    def set_active(
+        self,
+        *,
+        active_copy_layers: Set[int],
+        active_knowledge_layers: Set[int],
+        alpha2: float,
+        beta2: float,
+    ):
         self._enabled = True
+        self._active_copy_layers = set(int(x) for x in active_copy_layers)
+        self._active_knowledge_layers = set(int(x) for x in active_knowledge_layers)
         self._alpha2 = float(alpha2)
         self._beta2 = float(beta2)
 
     def disable(self):
         self._enabled = False
+        self._active_copy_layers = set()
+        self._active_knowledge_layers = set()
         self._alpha2 = 1.0
         self._beta2 = 1.0
 
@@ -82,17 +100,16 @@ class LayerReweighter:
 
         def make_attn_hook(layer_idx: int):
             def hook(module, inputs, outputs):
-                if not self._enabled:
+                if not self._enabled or layer_idx not in self._active_copy_layers:
                     return outputs
-                # outputs: (bs, seq, hidden)
-                return outputs * self._alpha2
+                return outputs * self._alpha2  # scale post-attention o_proj output
             return hook
 
         def make_mlp_hook(layer_idx: int):
             def hook(module, inputs, outputs):
-                if not self._enabled:
+                if not self._enabled or layer_idx not in self._active_knowledge_layers:
                     return outputs
-                return outputs * self._beta2
+                return outputs * self._beta2  # scale FFN down_proj output
             return hook
 
         for l in sorted(self.copy_layers):
@@ -112,12 +129,189 @@ class LayerReweighter:
             h.remove()
         self._handles = []
 
+def _get_input_text_with_template(tokenizer, prompt: str) -> str:
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_special_tokens=True,
+            add_generation_prompt=True,
+        )
+    return prompt
+
+
+def _get_sae_device_dtype(sae) -> tuple[torch.device, torch.dtype]:
+    device = getattr(sae, "device", None)
+    dtype = getattr(sae, "dtype", None)
+    if device is None or dtype is None:
+        try:
+            p = next(sae.parameters())
+            if device is None:
+                device = p.device
+            if dtype is None:
+                dtype = p.dtype
+        except StopIteration:
+            device = device or torch.device("cpu")
+            dtype = dtype or torch.float32
+    return device, dtype
+
+
+@torch.no_grad()
+def select_feature_guided_layers(
+    *,
+    model,
+    tokenizer,
+    detector: RAGLens,
+    sae,
+    prompt: str,
+    out_suffix: str,
+    max_active_features: int,
+    max_copy_layers_per_step: int,
+    max_knowledge_layers_per_step: int,
+) -> tuple[Set[int], Set[int]]:
+    """
+    SAE-feature-guided approximation of AARF+:
+      - compute SAE activations for the last token's circuit residual r=[r_ext;r_par]
+      - keep top positive features among detector.top_k_indices
+      - attribute each feature back to copy-head layers / knowledge layers via SAE encoder weights
+      - choose top layers to amplify/dampen
+
+    Note: This is an efficient attribution proxy (not integrated gradients).
+    """
+    copy_heads = detector.copy_heads or []
+    knowledge_layers = detector.knowledge_layers or []
+    if len(copy_heads) == 0 and len(knowledge_layers) == 0:
+        return set(), set()
+
+    copy_layers_all = {int(l) for (l, _h) in copy_heads}
+    knowledge_layers_all = {int(l) for l in knowledge_layers}
+
+    # Require SAE to be tensor-returning and have an encoder weight matrix for attribution.
+    if not hasattr(sae, "encode"):
+        return copy_layers_all, knowledge_layers_all
+    if not hasattr(sae, "encoder") or not hasattr(sae.encoder, "weight"):
+        return copy_layers_all, knowledge_layers_all
+
+    sae_device, sae_dtype = _get_sae_device_dtype(sae)
+
+    input_text = _get_input_text_with_template(tokenizer, prompt)
+    full_text = input_text + out_suffix
+
+    encoded = tokenizer(
+        full_text,
+        return_tensors="pt",
+        return_offsets_mapping=True,
+        add_special_tokens=False if getattr(tokenizer, "chat_template", None) else True,
+    )
+
+    input_ids = encoded["input_ids"].to(model.device)
+    attention_mask = encoded.get("attention_mask", None)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(model.device)
+
+    seq_len = input_ids.shape[-1]
+    token_idx = max(0, seq_len - 1)
+
+    res = get_mechsparse_residuals_llama_like(
+        model=model,
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        copy_heads=copy_heads,
+        knowledge_layers=knowledge_layers,
+        device=model.device,
+        token_idx=token_idx,
+        return_parts=True,
+    )
+
+    # Circuit residual for last token
+    r_ext_tok = res.r_ext[0, token_idx, :].to(sae_device).to(sae_dtype)
+    r_par_tok = res.r_par[0, token_idx, :].to(sae_device).to(sae_dtype)
+    r_cat_tok = torch.cat([r_ext_tok, r_par_tok], dim=-1)  # (2*hidden,)
+
+    z = sae.encode(r_cat_tok.unsqueeze(0))  # (1, d_sae) or EncoderOutput-like
+    if isinstance(z, torch.Tensor):
+        z_vec = z[0]
+    elif hasattr(z, "pre_acts"):
+        # SparseCoder returns an EncoderOutput-like NamedTuple
+        z_vec = z.pre_acts[0]
+    else:
+        return copy_layers_all, knowledge_layers_all
+
+    # Candidate feature indices from detector
+    if detector.top_k_indices is not None:
+        cand = detector.top_k_indices
+        if isinstance(cand, np.ndarray):
+            candidate = [int(x) for x in cand.tolist()]
+        else:
+            candidate = [int(x) for x in cand]
+    else:
+        candidate = list(range(z_vec.shape[0]))
+
+    active: list[tuple[int, float]] = []
+    for idx in candidate:
+        if idx < 0 or idx >= z_vec.numel():
+            continue
+        val = float(z_vec[idx].item())
+        if val > 0:
+            active.append((idx, val))
+
+    if not active:
+        return copy_layers_all, knowledge_layers_all
+
+    active.sort(key=lambda x: x[1], reverse=True)
+    active = active[: max_active_features]
+
+    hidden = int(model.config.hidden_size)
+    W = sae.encoder.weight.to(device=z_vec.device, dtype=z_vec.dtype)  # (d_sae, 2*hidden)
+    W_ext = W[:, :hidden]  # (d_sae, hidden)
+    W_par = W[:, hidden:]  # (d_sae, hidden)
+
+    copy_scores: Dict[int, float] = {}
+    knowledge_scores: Dict[int, float] = {}
+
+    if res.r_ext_parts is None or res.r_par_parts is None:
+        return copy_layers_all, knowledge_layers_all
+
+    for feat_idx, _val in active:
+        wext_j = W_ext[feat_idx]  # (hidden,)
+        wpar_j = W_par[feat_idx]  # (hidden,)
+
+        # Copy layers: for each (layer, head) component, score by dot product.
+        for (l, _h), head_vec in res.r_ext_parts.items():
+            head_vec_tok = head_vec[0].to(device=wext_j.device, dtype=wext_j.dtype)
+            score = float(torch.dot(wext_j, head_vec_tok).item())
+            prev = copy_scores.get(int(l), -1e18)
+            copy_scores[int(l)] = max(prev, score)
+
+        # Knowledge layers: per-layer FFN down_proj contribution.
+        for l, layer_vec in res.r_par_parts.items():
+            layer_vec_tok = layer_vec[0].to(device=wpar_j.device, dtype=wpar_j.dtype)
+            score = float(torch.dot(wpar_j, layer_vec_tok).item())
+            prev = knowledge_scores.get(int(l), -1e18)
+            knowledge_scores[int(l)] = max(prev, score)
+
+    active_copy_layers = set(
+        sorted(copy_scores.keys(), key=lambda l: copy_scores[l], reverse=True)[: max_copy_layers_per_step]
+    )
+    active_knowledge_layers = set(
+        sorted(knowledge_scores.keys(), key=lambda l: knowledge_scores[l], reverse=True)[: max_knowledge_layers_per_step]
+    )
+
+    # Fallback to safe full circuit sets if selection fails.
+    if not active_copy_layers:
+        active_copy_layers = set(copy_layers_all)
+    if not active_knowledge_layers:
+        active_knowledge_layers = set(knowledge_layers_all)
+
+    return active_copy_layers, active_knowledge_layers
+
 
 def generate_with_aarf_plus(
     *,
     model,
     tokenizer,
     detector: RAGLens,
+    sae,
     prompt: str,
     cfg: ReweightConfig,
     max_new_tokens: int,
@@ -166,7 +360,23 @@ def generate_with_aarf_plus(
                 p_hall = 0.0
 
             if p_hall > cfg.tau:
-                reweighter.enable(alpha2=cfg.alpha2, beta2=cfg.beta2)
+                active_copy_layers, active_knowledge_layers = select_feature_guided_layers(
+                    model=model,
+                    tokenizer=tokenizer,
+                    detector=detector,
+                    sae=sae,
+                    prompt=prompt,
+                    out_suffix=out_suffix,
+                    max_active_features=cfg.max_active_features,
+                    max_copy_layers_per_step=cfg.max_copy_layers_per_step,
+                    max_knowledge_layers_per_step=cfg.max_knowledge_layers_per_step,
+                )
+                reweighter.set_active(
+                    active_copy_layers=active_copy_layers,
+                    active_knowledge_layers=active_knowledge_layers,
+                    alpha2=cfg.alpha2,
+                    beta2=cfg.beta2,
+                )
             else:
                 reweighter.disable()
 
@@ -195,6 +405,9 @@ def main():
     parser.add_argument("--tau", type=float, default=0.5)
     parser.add_argument("--alpha2", type=float, default=1.3)
     parser.add_argument("--beta2", type=float, default=0.7)
+    parser.add_argument("--max_active_features", type=int, default=8)
+    parser.add_argument("--max_copy_layers_per_step", type=int, default=6)
+    parser.add_argument("--max_knowledge_layers_per_step", type=int, default=6)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -213,15 +426,24 @@ def main():
             raise RuntimeError(
                 "Please set env MECHSPARSE_SAE_PATH to a trained SAE checkpoint path (torch.load)."
             )
-    sae = torch.load(sae_path, map_location="cpu")
+    sae = torch.load(sae_path, map_location=model.device)
+    sae.eval()
 
     detector = RAGLens.load(args.detector_pkl, tokenizer=tokenizer, model=model, sae=sae)
 
-    cfg = ReweightConfig(tau=args.tau, alpha2=args.alpha2, beta2=args.beta2)
+    cfg = ReweightConfig(
+        tau=args.tau,
+        alpha2=args.alpha2,
+        beta2=args.beta2,
+        max_active_features=args.max_active_features,
+        max_copy_layers_per_step=args.max_copy_layers_per_step,
+        max_knowledge_layers_per_step=args.max_knowledge_layers_per_step,
+    )
     text = generate_with_aarf_plus(
         model=model,
         tokenizer=tokenizer,
         detector=detector,
+        sae=sae,
         prompt=args.prompt,
         cfg=cfg,
         max_new_tokens=args.max_new_tokens,

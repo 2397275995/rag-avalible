@@ -4,6 +4,26 @@ from typing import List, Optional, Sequence, Tuple
 
 from mechsparse_residuals import get_mechsparse_residuals_llama_like
 
+
+def _get_sae_device_dtype(sae) -> tuple[torch.device, torch.dtype]:
+    """
+    Some SAE implementations (e.g. sparsify.SparseCoder) expose .device/.dtype,
+    while the repo's SimpleSAE only has parameters.
+    """
+    device = getattr(sae, "device", None)
+    dtype = getattr(sae, "dtype", None)
+    if device is None or dtype is None:
+        try:
+            p = next(sae.parameters())
+            if device is None:
+                device = p.device
+            if dtype is None:
+                dtype = p.dtype
+        except StopIteration:
+            device = device or torch.device("cpu")
+            dtype = dtype or torch.float32
+    return device, dtype
+
 def sae_encoding(input_ids, attention_mask, hookpoint, model, sae, activation=False, topk=False):
     hook_results = []
     def get_hidden_state(module, inputs, outputs):
@@ -21,22 +41,31 @@ def sae_encoding(input_ids, attention_mask, hookpoint, model, sae, activation=Fa
         )
         hidden_state = hook_results[0]
         handle.remove()
-        features = sae.encode(hidden_state.to(sae.device).to(sae.dtype))
+        sae_device, sae_dtype = _get_sae_device_dtype(sae)
+        features = sae.encode(hidden_state.to(sae_device).to(sae_dtype))
     if not topk:        
-        if type(sae).__name__ == 'SparseAutoEncoder':
-            pre_acts = features
-        else:
+        # Tensor-returning SAE (e.g. SimpleSAE): already equals pre-acts / activations.
+        if isinstance(features, torch.Tensor):
+            return features
+
+        # SparseCoder/SAE-style output: expect EncoderOutput-like object with pre_acts.
+        if hasattr(features, "pre_acts"):
             if activation:
-                pre_acts = torch.zeros_like(features.pre_acts)
-                pre_acts = pre_acts.scatter(1, features.top_indices, features.top_acts)
-            else:
-                pre_acts = features.pre_acts
-        return pre_acts
+                # Keep only top-k activations (requires top_indices/top_acts).
+                if hasattr(features, "top_indices") and hasattr(features, "top_acts"):
+                    pre_acts = torch.zeros_like(features.pre_acts)
+                    pre_acts = pre_acts.scatter(1, features.top_indices, features.top_acts)
+                    return pre_acts
+            return features.pre_acts
+
+        raise ValueError(f"Unsupported SAE encode output type: {type(features)}")
     else:
-        if type(sae).__name__ == 'SparseAutoEncoder':
-            raise ValueError("topk not supported for SparseAutoEncoder")
-        else:
+        if isinstance(features, torch.Tensor):
+            raise ValueError("topk not supported for Tensor-returning SAE")
+
+        if hasattr(features, "top_acts") and hasattr(features, "top_indices"):
             return features.top_acts, features.top_indices
+        raise ValueError("SAE encode output missing top_acts/top_indices required for topk=True")
 
 def encode_outputs(inputs, outputs, hookpoint, tokenizer, model, sae, agg="max", activation=False, show_progress=True, fixed_indices=None):
     assert len(inputs) == len(outputs)
@@ -152,15 +181,20 @@ def encode_mechsparse_outputs(
         r = torch.cat([batch_res.r_ext[0], batch_res.r_par[0]], dim=-1)
 
         # SAE encode expects (tokens, d_in)
-        z = sae.encode(r.to(sae.device).to(sae.dtype))
-        if type(sae).__name__ == "SparseAutoEncoder":
+        sae_device, sae_dtype = _get_sae_device_dtype(sae)
+        z = sae.encode(r.to(sae_device).to(sae_dtype))
+        # Tensor-returning SAE (SimpleSAE): z is already a (tokens, d_sae) activation matrix.
+        if isinstance(z, torch.Tensor):
             pre_acts = z
         else:
-            if activation:
-                pre_acts = torch.zeros_like(z.pre_acts)
-                pre_acts = pre_acts.scatter(1, z.top_indices, z.top_acts)
+            if type(sae).__name__ == "SparseAutoEncoder":
+                pre_acts = z
             else:
-                pre_acts = z.pre_acts
+                if activation:
+                    pre_acts = torch.zeros_like(z.pre_acts)
+                    pre_acts = pre_acts.scatter(1, z.top_indices, z.top_acts)
+                else:
+                    pre_acts = z.pre_acts
 
         token_feats = pre_acts[output_start_idx:output_end_idx]
         if agg == "max":
